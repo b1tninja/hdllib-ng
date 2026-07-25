@@ -1,0 +1,402 @@
+#include "cmd.hpp"
+#include "usage.hpp"
+#include "util.hpp"
+
+#include "protocol.hpp"
+#include "hdllib/hdllib.h"
+
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+int CmdPing(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    AppendPod(req, static_cast<uint32_t>(OpPing));
+    if (!ctx.client.Request(req, resp)) {
+        wprintf(L"IPC request failed\n");
+        return 1;
+    }
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t rpid = 0;
+    if (!r.TakePod(st) || !r.TakePod(rpid)) {
+        wprintf(L"Bad response\n");
+        return 1;
+    }
+    wprintf(L"status=%ls remote_pid=%u\n", StatusName(st), rpid);
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdLog(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    if (ctx.argc < 4) {
+        PrintUsage();
+        return 1;
+    }
+    AppendPod(req, static_cast<uint32_t>(OpSetLogLevel));
+    AppendPod(req, static_cast<int32_t>(_wtoi(ctx.argv[3])));
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    r.TakePod(st);
+    wprintf(L"status=%ls\n", StatusName(st));
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdModules(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    bool stream = false;
+    for (int i = 3; i < ctx.argc; ++i) {
+        if (wcscmp(ctx.argv[i], L"--stream") == 0) {
+            stream = true;
+        }
+    }
+    AppendPod(req, static_cast<uint32_t>(OpEnumModules));
+    if (stream) {
+        AppendPod(req, static_cast<uint64_t>(0));
+        AppendPod(req, static_cast<uint32_t>(0));
+        AppendPod(req, static_cast<uint32_t>(HDL_IPC_REQ_STREAM));
+        uint32_t printed = 0;
+        if (!ctx.client.RequestStream(req, [&](int32_t st, uint32_t flags, const uint8_t* p, size_t n) {
+                Reader r(p, n);
+                uint32_t total = 0, off = 0, count = 0;
+                if (!r.TakePod(total) || !r.TakePod(off) || !r.TakePod(count)) {
+                    return false;
+                }
+                if (printed == 0) {
+                    wprintf(L"status=%ls total=%u (stream)\n", StatusName(st), total);
+                }
+                for (uint32_t i = 0; i < count; ++i) {
+                    HdlModuleInfo info{};
+                    if (!r.Take(&info, sizeof(info))) {
+                        return false;
+                    }
+                    wprintf(L"  %016llx  %8llx  %ls\n",
+                            static_cast<unsigned long long>(info.base),
+                            static_cast<unsigned long long>(info.size), info.path);
+                    ++printed;
+                }
+                (void)flags;
+                return true;
+            })) {
+            return 1;
+        }
+        return 0;
+    }
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t count = 0;
+    if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+    wprintf(L"status=%ls count=%u\n", StatusName(st), count);
+    for (uint32_t i = 0; i < count; ++i) {
+        HdlModuleInfo info{};
+        if (!r.Take(&info, sizeof(info))) break;
+        wprintf(L"  %016llx  %8llx  %ls\n",
+                static_cast<unsigned long long>(info.base),
+                static_cast<unsigned long long>(info.size),
+                info.path);
+    }
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdRegions(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    bool stream = false;
+    for (int i = 3; i < ctx.argc; ++i) {
+        if (wcscmp(ctx.argv[i], L"--stream") == 0) stream = true;
+    }
+    AppendPod(req, static_cast<uint32_t>(OpEnumRegions));
+    if (stream) {
+        AppendPod(req, static_cast<uint64_t>(0));
+        AppendPod(req, static_cast<uint32_t>(0));
+        AppendPod(req, static_cast<uint32_t>(HDL_IPC_REQ_STREAM));
+        if (!ctx.client.RequestStream(req, [&](int32_t st, uint32_t, const uint8_t* p, size_t n) {
+                Reader r(p, n);
+                uint32_t total = 0, off = 0, count = 0;
+                if (!r.TakePod(total) || !r.TakePod(off) || !r.TakePod(count)) return false;
+                if (off == 0) wprintf(L"status=%ls total=%u\n", StatusName(st), total);
+                for (uint32_t i = 0; i < count; ++i) {
+                    HdlRegionInfo info{};
+                    if (!r.Take(&info, sizeof(info))) return false;
+                    wprintf(L"  %016llx  %8llx  prot=%08x\n",
+                            static_cast<unsigned long long>(info.base),
+                            static_cast<unsigned long long>(info.size), info.protect);
+                }
+                return true;
+            })) {
+            return 1;
+        }
+        return 0;
+    }
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t count = 0;
+    if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+    wprintf(L"status=%ls count=%u\n", StatusName(st), count);
+    const uint32_t show = count < 50 ? count : 50;
+    for (uint32_t i = 0; i < show; ++i) {
+        HdlRegionInfo info{};
+        if (!r.Take(&info, sizeof(info))) break;
+        wprintf(L"  %016llx  %8llx  prot=%08x\n",
+                static_cast<unsigned long long>(info.base),
+                static_cast<unsigned long long>(info.size),
+                info.protect);
+    }
+    if (count > show) {
+        wprintf(L"  ... (%u more)\n", count - show);
+    }
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdThreads(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    bool stream = false;
+    for (int i = 3; i < ctx.argc; ++i) {
+        if (wcscmp(ctx.argv[i], L"--stream") == 0) stream = true;
+    }
+    AppendPod(req, static_cast<uint32_t>(OpEnumThreads));
+    if (stream) {
+        AppendPod(req, static_cast<uint64_t>(0));
+        AppendPod(req, static_cast<uint32_t>(0));
+        AppendPod(req, static_cast<uint32_t>(HDL_IPC_REQ_STREAM));
+        if (!ctx.client.RequestStream(req, [&](int32_t st, uint32_t, const uint8_t* p, size_t n) {
+                Reader r(p, n);
+                uint32_t total = 0, off = 0, count = 0;
+                if (!r.TakePod(total) || !r.TakePod(off) || !r.TakePod(count)) return false;
+                if (off == 0) wprintf(L"status=%ls total=%u\n", StatusName(st), total);
+                for (uint32_t i = 0; i < count; ++i) {
+                    HdlThreadInfo info{};
+                    if (!r.Take(&info, sizeof(info))) return false;
+                    wprintf(L"  tid=%u start=%016llx\n", info.tid,
+                            static_cast<unsigned long long>(info.start_address));
+                }
+                return true;
+            })) {
+            return 1;
+        }
+        return 0;
+    }
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t count = 0;
+    if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+    wprintf(L"status=%ls count=%u\n", StatusName(st), count);
+    for (uint32_t i = 0; i < count; ++i) {
+        HdlThreadInfo info{};
+        if (!r.Take(&info, sizeof(info))) break;
+        wprintf(L"  tid=%u start=%016llx user=%llu kernel=%llu\n", info.tid,
+                static_cast<unsigned long long>(info.start_address),
+                static_cast<unsigned long long>(info.user_time_100ns),
+                static_cast<unsigned long long>(info.kernel_time_100ns));
+    }
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdHealth(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    AppendPod(req, static_cast<uint32_t>(OpGetHealth));
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    HdlHealthInfo info{};
+    if (!r.TakePod(st) || !r.Take(&info, sizeof(info))) return 1;
+    wprintf(L"status=%ls pid=%u threads=%u handles=%u cpu=%u%% hung=%u flags=0x%x\n",
+            StatusName(st), info.pid, info.thread_count, info.handle_count, info.cpu_percent,
+            info.gui_hung, info.flags);
+    wprintf(L"  working_set=%llu private=%llu last_exc=0x%x @ %016llx\n",
+            static_cast<unsigned long long>(info.working_set),
+            static_cast<unsigned long long>(info.private_bytes), info.last_exception_code,
+            static_cast<unsigned long long>(info.last_exception_addr));
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdEvents(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    uint32_t timeout_ms = 0;
+    uint32_t max_events = 16;
+    for (int i = 3; i < ctx.argc; ++i) {
+        if (wcscmp(ctx.argv[i], L"--timeout") == 0 && i + 1 < ctx.argc) {
+            timeout_ms = static_cast<uint32_t>(_wtoi(ctx.argv[++i]));
+        } else if (wcscmp(ctx.argv[i], L"--max") == 0 && i + 1 < ctx.argc) {
+            max_events = static_cast<uint32_t>(_wtoi(ctx.argv[++i]));
+        }
+    }
+    AppendPod(req, static_cast<uint32_t>(OpPollEvents));
+    AppendPod(req, max_events);
+    AppendPod(req, timeout_ms);
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t count = 0;
+    if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+    wprintf(L"status=%ls events=%u\n", StatusName(st), count);
+    for (uint32_t i = 0; i < count; ++i) {
+        HdlEvent ev{};
+        if (!r.Take(&ev, sizeof(ev))) break;
+        wprintf(L"  type=%u code=0x%x ts=%llu addr=%016llx\n", ev.type, ev.code,
+                static_cast<unsigned long long>(ev.timestamp_ms),
+                static_cast<unsigned long long>(ev.address));
+    }
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdJob(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    if (ctx.argc < 4) {
+        PrintUsage();
+        return 1;
+    }
+    if (wcscmp(ctx.argv[3], L"create") == 0) {
+        uint32_t timeout_ms = 0;
+        for (int i = 4; i < ctx.argc; ++i) {
+            if (wcscmp(ctx.argv[i], L"--timeout") == 0 && i + 1 < ctx.argc) {
+                timeout_ms = static_cast<uint32_t>(_wtoi(ctx.argv[++i]));
+            }
+        }
+        AppendPod(req, static_cast<uint32_t>(OpJobCreate));
+        AppendPod(req, timeout_ms);
+        if (!ctx.client.Request(req, resp)) return 1;
+        Reader r(resp);
+        int32_t st = 0;
+        uint64_t id = 0;
+        if (!r.TakePod(st) || !r.TakePod(id)) return 1;
+        wprintf(L"status=%ls job=%llu\n", StatusName(st), static_cast<unsigned long long>(id));
+        return st == HDL_OK ? 0 : 1;
+    }
+    if (ctx.argc < 5) {
+        PrintUsage();
+        return 1;
+    }
+    const uint64_t id = _wcstoui64(ctx.argv[4], nullptr, 0);
+    AppendPod(req, static_cast<uint32_t>(wcscmp(ctx.argv[3], L"cancel") == 0 ? OpJobCancel : OpJobClose));
+    AppendPod(req, id);
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    r.TakePod(st);
+    wprintf(L"status=%ls job=%llu\n", StatusName(st), static_cast<unsigned long long>(id));
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdRead(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    if (ctx.argc < 5) {
+        PrintUsage();
+        return 1;
+    }
+    uint64_t address = 0;
+    uint64_t size64 = 0;
+    if (!ParseHexU64(ctx.argv[3], &address) || !ParseHexU64(ctx.argv[4], &size64)) {
+        wprintf(L"Bad address/size\n");
+        return 1;
+    }
+    AppendPod(req, static_cast<uint32_t>(OpReadMemory));
+    AppendPod(req, address);
+    AppendPod(req, static_cast<uint32_t>(size64));
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t got = 0;
+    if (!r.TakePod(st) || !r.TakePod(got)) return 1;
+    wprintf(L"status=%ls bytes=%u\n", StatusName(st), got);
+    for (uint32_t i = 0; i < got; ++i) {
+        uint8_t b = 0;
+        if (!r.TakePod(b)) break;
+        wprintf(L"%02X%s", b, ((i + 1) % 16 == 0 || i + 1 == got) ? L"\n" : L" ");
+    }
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdWrite(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    if (ctx.argc < 5) {
+        PrintUsage();
+        return 1;
+    }
+    uint64_t address = 0;
+    if (!ParseHexU64(ctx.argv[3], &address)) {
+        wprintf(L"Bad address\n");
+        return 1;
+    }
+    std::vector<uint8_t> bytes;
+    if (ctx.argv[4][0] == L'@') {
+        const wchar_t* path = ctx.argv[4] + 1;
+        HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            wprintf(L"Failed to open %ls\n", path);
+            return 1;
+        }
+        LARGE_INTEGER sz{};
+        if (!GetFileSizeEx(f, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 16 * 1024 * 1024) {
+            CloseHandle(f);
+            wprintf(L"Bad file size\n");
+            return 1;
+        }
+        bytes.resize(static_cast<size_t>(sz.QuadPart));
+        DWORD got = 0;
+        const BOOL ok = ReadFile(f, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr);
+        CloseHandle(f);
+        if (!ok || got != bytes.size()) {
+            wprintf(L"Failed to read file\n");
+            return 1;
+        }
+    } else if (!ParseHexBytes(ctx.argv[4], bytes) || bytes.empty()) {
+        wprintf(L"Bad hex bytes (or use @file)\n");
+        return 1;
+    }
+    AppendPod(req, static_cast<uint32_t>(OpWriteMemory));
+    AppendPod(req, address);
+    AppendPod(req, static_cast<uint32_t>(bytes.size()));
+    AppendBytes(req, bytes.data(), bytes.size());
+    if (!ctx.client.Request(req, resp)) {
+        return 1;
+    }
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t wrote = 0;
+    if (!r.TakePod(st) || !r.TakePod(wrote)) {
+        return 1;
+    }
+    wprintf(L"status=%ls wrote=%u\n", StatusName(st), wrote);
+    return st == HDL_OK ? 0 : 1;
+}
+

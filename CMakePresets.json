@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "x64-windows",
+      "displayName": "x64 Windows MSVC",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "x64-windows-vs",
+      "displayName": "x64 Windows VS 2019",
+      "generator": "Visual Studio 16 2019",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x64-windows",
+      "configurePreset": "x64-windows"
+    },
+    {
+      "name": "x64-windows-vs",
+      "configurePreset": "x64-windows-vs",
+      "configuration": "Release"
+    }
+  ]
+}

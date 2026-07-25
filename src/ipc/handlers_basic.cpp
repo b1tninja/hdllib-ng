@@ -1,0 +1,259 @@
+#include "handlers.hpp"
+
+#include "health.hpp"
+#include "inject.hpp"
+#include "jobs.hpp"
+#include "log.hpp"
+#include "memory.hpp"
+#include "protocol.hpp"
+
+#include <string>
+#include <vector>
+
+namespace hdl {
+namespace ipc {
+
+bool HandlePing(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    (void)r;
+    std::vector<uint8_t> resp;
+    AppendPod(resp, static_cast<int32_t>(HDL_OK));
+    AppendPod(resp, static_cast<uint32_t>(GetCurrentProcessId()));
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleSetLogLevel(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    int32_t level = 0;
+    if (!r.TakePod(level)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    SetLogLevel(static_cast<LogLevel>(level));
+    AppendPod(resp, static_cast<int32_t>(HDL_OK));
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleInjectDll(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint32_t pid = 0;
+    uint32_t method = HDL_INJECT_CREATE_REMOTE_THREAD;
+    std::wstring path;
+    std::wstring exe_path;
+    std::string hook_export;
+    if (!r.TakePod(pid) || !r.TakePod(method) || !r.TakeWString(path) || !r.TakeWString(exe_path) ||
+        !r.TakeString(hook_export)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    uint64_t base = 0;
+    uint32_t out_pid = 0;
+    const HdlStatus st = InjectDllEx(pid, path.c_str(), static_cast<int>(method),
+                                     exe_path.empty() ? nullptr : exe_path.c_str(),
+                                     hook_export.empty() ? nullptr : hook_export.c_str(), &out_pid,
+                                     &base);
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendPod(resp, base);
+    AppendPod(resp, out_pid);
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleReadMemory(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t address = 0;
+    uint32_t size = 0;
+    if (!r.TakePod(address) || !r.TakePod(size) || size > 16u * 1024u * 1024u) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    std::vector<uint8_t> buf(size);
+    size_t got = 0;
+    const HdlStatus st = ReadMemory(address, buf.data(), size, &got);
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendPod(resp, static_cast<uint32_t>(got));
+    if (got) {
+        AppendBytes(resp, buf.data(), got);
+    }
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleWriteMemory(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t address = 0;
+    uint32_t size = 0;
+    if (!r.TakePod(address) || !r.TakePod(size) || size > 16u * 1024u * 1024u || r.left < size) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    size_t wrote = 0;
+    const HdlStatus st = WriteMemory(address, r.p, size, &wrote);
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendPod(resp, static_cast<uint32_t>(wrote));
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleEnumRegions(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t job_id = 0;
+    uint32_t timeout_ms = 0;
+    uint32_t flags = 0;
+    // Legacy: no trailer. Stream path uses optional trailer after empty body.
+    TakeOptionalJobTimeoutFlags(r, &job_id, &timeout_ms, &flags);
+    (void)job_id;
+    (void)timeout_ms;
+
+    uint32_t count = 0;
+    EnumRegions(nullptr, &count);
+    std::vector<HdlRegionInfo> regions(count);
+    const HdlStatus st = count ? EnumRegions(regions.data(), &count) : HDL_OK;
+
+    if (flags & HDL_IPC_REQ_STREAM) {
+        return WriteStreamed(pipe, st, regions.data(), count, 64);
+    }
+
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendPod(resp, count);
+    if (count) {
+        AppendBytes(resp, regions.data(), count * sizeof(HdlRegionInfo));
+    }
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleEnumModules(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t job_id = 0;
+    uint32_t timeout_ms = 0;
+    uint32_t flags = 0;
+    TakeOptionalJobTimeoutFlags(r, &job_id, &timeout_ms, &flags);
+    (void)job_id;
+    (void)timeout_ms;
+
+    uint32_t count = 0;
+    EnumModules(nullptr, &count);
+    std::vector<HdlModuleInfo> modules(count);
+    const HdlStatus st = count ? EnumModules(modules.data(), &count) : HDL_OK;
+
+    if (flags & HDL_IPC_REQ_STREAM) {
+        return WriteStreamed(pipe, st, modules.data(), count, 16);
+    }
+
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendPod(resp, count);
+    if (count) {
+        AppendBytes(resp, modules.data(), count * sizeof(HdlModuleInfo));
+    }
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleJobCreate(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint32_t timeout_ms = 0;
+    if (!r.TakePod(timeout_ms)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    auto job = JobCreate(timeout_ms);
+    AppendPod(resp, static_cast<int32_t>(HDL_OK));
+    AppendPod(resp, job->id);
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleJobCancel(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t id = 0;
+    if (!r.TakePod(id)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    if (!JobFind(id)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_NOT_FOUND));
+        return WriteFrame(pipe, resp);
+    }
+    JobCancel(id);
+    AppendPod(resp, static_cast<int32_t>(HDL_OK));
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleJobClose(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t id = 0;
+    if (!r.TakePod(id)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    JobClose(id);
+    AppendPod(resp, static_cast<int32_t>(HDL_OK));
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleGetHealth(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    (void)r;
+    std::vector<uint8_t> resp;
+    HdlHealthInfo info{};
+    const HdlStatus st = GetHealth(&info);
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendBytes(resp, &info, sizeof(info));
+    return WriteFrame(pipe, resp);
+}
+
+bool HandleEnumThreads(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint64_t job_id = 0;
+    uint32_t timeout_ms = 0;
+    uint32_t flags = 0;
+    TakeOptionalJobTimeoutFlags(r, &job_id, &timeout_ms, &flags);
+    (void)job_id;
+    (void)timeout_ms;
+
+    uint32_t count = 0;
+    EnumThreads(nullptr, &count);
+    std::vector<HdlThreadInfo> threads(count);
+    const HdlStatus st = count ? EnumThreads(threads.data(), &count) : HDL_OK;
+
+    if (flags & HDL_IPC_REQ_STREAM) {
+        return WriteStreamed(pipe, st, threads.data(), count, 32);
+    }
+
+    AppendPod(resp, static_cast<int32_t>(st));
+    AppendPod(resp, count);
+    if (count) {
+        AppendBytes(resp, threads.data(), count * sizeof(HdlThreadInfo));
+    }
+    return WriteFrame(pipe, resp);
+}
+
+bool HandlePollEvents(HANDLE pipe, proto::Reader& r) {
+    using namespace proto;
+    std::vector<uint8_t> resp;
+    uint32_t max_events = 0;
+    uint32_t timeout_ms = 0;
+    if (!r.TakePod(max_events) || !r.TakePod(timeout_ms)) {
+        AppendPod(resp, static_cast<int32_t>(HDL_E_INVALID_ARG));
+        return WriteFrame(pipe, resp);
+    }
+    if (max_events == 0 || max_events > 64) {
+        max_events = 64;
+    }
+    std::vector<HdlEvent> events(max_events);
+    const uint32_t got = HealthPollEvents(events.data(), max_events, timeout_ms);
+    AppendPod(resp, static_cast<int32_t>(HDL_OK));
+    AppendPod(resp, got);
+    if (got) {
+        AppendBytes(resp, events.data(), got * sizeof(HdlEvent));
+    }
+    return WriteFrame(pipe, resp);
+}
+
+}  // namespace ipc
+}  // namespace hdl

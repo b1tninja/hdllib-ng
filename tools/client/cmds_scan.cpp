@@ -1,0 +1,486 @@
+#include "cmd.hpp"
+#include "usage.hpp"
+#include "util.hpp"
+
+#include "protocol.hpp"
+#include "hdllib/hdllib.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+bool ParseValueType(const wchar_t* s, int32_t* out) {
+    if (!s || !out) return false;
+    if (_wcsicmp(s, L"bytes") == 0 || _wcsicmp(s, L"aob") == 0) {
+        *out = HDL_VALUE_BYTES;
+    } else if (_wcsicmp(s, L"i8") == 0) {
+        *out = HDL_VALUE_I8;
+    } else if (_wcsicmp(s, L"u8") == 0) {
+        *out = HDL_VALUE_U8;
+    } else if (_wcsicmp(s, L"i16") == 0) {
+        *out = HDL_VALUE_I16;
+    } else if (_wcsicmp(s, L"u16") == 0) {
+        *out = HDL_VALUE_U16;
+    } else if (_wcsicmp(s, L"i32") == 0) {
+        *out = HDL_VALUE_I32;
+    } else if (_wcsicmp(s, L"u32") == 0) {
+        *out = HDL_VALUE_U32;
+    } else if (_wcsicmp(s, L"i64") == 0) {
+        *out = HDL_VALUE_I64;
+    } else if (_wcsicmp(s, L"u64") == 0) {
+        *out = HDL_VALUE_U64;
+    } else if (_wcsicmp(s, L"f32") == 0 || _wcsicmp(s, L"float") == 0) {
+        *out = HDL_VALUE_F32;
+    } else if (_wcsicmp(s, L"f64") == 0 || _wcsicmp(s, L"double") == 0) {
+        *out = HDL_VALUE_F64;
+    } else if (_wcsicmp(s, L"string") == 0) {
+        *out = HDL_VALUE_STRING;
+    } else if (_wcsicmp(s, L"wstring") == 0) {
+        *out = HDL_VALUE_WSTRING;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool ParseCmp(const wchar_t* s, int32_t* out) {
+    if (!s || !out) return false;
+    if (_wcsicmp(s, L"exact") == 0) {
+        *out = HDL_CMP_EXACT;
+    } else if (_wcsicmp(s, L"unknown") == 0) {
+        *out = HDL_CMP_UNKNOWN;
+    } else if (_wcsicmp(s, L"changed") == 0) {
+        *out = HDL_CMP_CHANGED;
+    } else if (_wcsicmp(s, L"unchanged") == 0) {
+        *out = HDL_CMP_UNCHANGED;
+    } else if (_wcsicmp(s, L"increased") == 0) {
+        *out = HDL_CMP_INCREASED;
+    } else if (_wcsicmp(s, L"decreased") == 0) {
+        *out = HDL_CMP_DECREASED;
+    } else if (_wcsicmp(s, L"increased_by") == 0) {
+        *out = HDL_CMP_INCREASED_BY;
+    } else if (_wcsicmp(s, L"decreased_by") == 0) {
+        *out = HDL_CMP_DECREASED_BY;
+    } else if (_wcsicmp(s, L"greater") == 0) {
+        *out = HDL_CMP_GREATER;
+    } else if (_wcsicmp(s, L"less") == 0) {
+        *out = HDL_CMP_LESS;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+size_t ValueTypeWidth(int32_t type) {
+    switch (type) {
+    case HDL_VALUE_I8:
+    case HDL_VALUE_U8:
+        return 1;
+    case HDL_VALUE_I16:
+    case HDL_VALUE_U16:
+        return 2;
+    case HDL_VALUE_I32:
+    case HDL_VALUE_U32:
+    case HDL_VALUE_F32:
+        return 4;
+    case HDL_VALUE_I64:
+    case HDL_VALUE_U64:
+    case HDL_VALUE_F64:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+bool EncodeTypedValue(int32_t type, const wchar_t* text, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!text) {
+        return false;
+    }
+    if (type == HDL_VALUE_BYTES) {
+        char buf[1024];
+        if (!WideCharToMultiByte(CP_UTF8, 0, text, -1, buf, sizeof(buf), nullptr, nullptr)) {
+            return false;
+        }
+        out.assign(reinterpret_cast<uint8_t*>(buf),
+                   reinterpret_cast<uint8_t*>(buf) + strlen(buf) + 1);
+        return true;
+    }
+    if (type == HDL_VALUE_STRING) {
+        char buf[1024];
+        const int n =
+            WideCharToMultiByte(CP_UTF8, 0, text, -1, buf, sizeof(buf), nullptr, nullptr);
+        if (n <= 1) {
+            return false;
+        }
+        out.assign(reinterpret_cast<uint8_t*>(buf), reinterpret_cast<uint8_t*>(buf) + (n - 1));
+        return true;
+    }
+    if (type == HDL_VALUE_WSTRING) {
+        const size_t n = wcslen(text) * sizeof(wchar_t);
+        out.resize(n);
+        memcpy(out.data(), text, n);
+        return n > 0;
+    }
+
+    const size_t width = ValueTypeWidth(type);
+    if (width == 0) {
+        return false;
+    }
+    out.resize(width);
+    wchar_t* end = nullptr;
+    if (type == HDL_VALUE_F32) {
+        const float v = static_cast<float>(wcstod(text, &end));
+        if (end == text) return false;
+        memcpy(out.data(), &v, 4);
+        return true;
+    }
+    if (type == HDL_VALUE_F64) {
+        const double v = wcstod(text, &end);
+        if (end == text) return false;
+        memcpy(out.data(), &v, 8);
+        return true;
+    }
+    if (type == HDL_VALUE_I8 || type == HDL_VALUE_I16 || type == HDL_VALUE_I32 ||
+        type == HDL_VALUE_I64) {
+        const int64_t v = _wcstoi64(text, &end, 0);
+        if (end == text) return false;
+        memcpy(out.data(), &v, width);
+        return true;
+    }
+    const uint64_t v = _wcstoui64(text, &end, 0);
+    if (end == text) return false;
+    memcpy(out.data(), &v, width);
+    return true;
+}
+
+bool IpcCreateSession(PipeClient& client, uint64_t* out_id) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+    AppendPod(req, static_cast<uint32_t>(OpSearchCreate));
+    if (!client.Request(req, resp)) return false;
+    Reader r(resp);
+    int32_t st = 0;
+    if (!r.TakePod(st) || !r.TakePod(*out_id) || st != HDL_OK) {
+        wprintf(L"scan-create status=%ls\n", StatusName(st));
+        return false;
+    }
+    return true;
+}
+
+int PrintScanHits(PipeClient& client, uint64_t session, uint32_t max_hits, bool stream) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+    AppendPod(req, static_cast<uint32_t>(OpSearchGetHits));
+    AppendPod(req, session);
+    AppendPod(req, max_hits);
+    AppendPod(req, static_cast<uint64_t>(0));
+    AppendPod(req, static_cast<uint32_t>(0));
+    AppendPod(req, stream ? static_cast<uint32_t>(HDL_IPC_REQ_STREAM) : 0u);
+    if (stream) {
+        if (!client.RequestStream(req, [&](int32_t st, uint32_t, const uint8_t* p, size_t n) {
+                Reader r(p, n);
+                uint32_t total = 0, off = 0, count = 0;
+                if (!r.TakePod(total) || !r.TakePod(off) || !r.TakePod(count)) return false;
+                if (off == 0) {
+                    wprintf(L"status=%ls total=%u session=%llu\n", StatusName(st), total,
+                            static_cast<unsigned long long>(session));
+                }
+                for (uint32_t i = 0; i < count; ++i) {
+                    uint64_t hit = 0;
+                    if (!r.TakePod(hit)) return false;
+                    wprintf(L"  %016llx\n", static_cast<unsigned long long>(hit));
+                }
+                return true;
+            })) {
+            return 1;
+        }
+        return 0;
+    }
+    if (!client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t total = 0;
+    uint32_t got = 0;
+    if (!r.TakePod(st) || !r.TakePod(total) || !r.TakePod(got)) return 1;
+    wprintf(L"status=%ls total=%u showing=%u session=%llu\n", StatusName(st), total, got,
+            static_cast<unsigned long long>(session));
+    for (uint32_t i = 0; i < got; ++i) {
+        uint64_t hit = 0;
+        if (!r.TakePod(hit)) break;
+        wprintf(L"  %016llx\n", static_cast<unsigned long long>(hit));
+    }
+    return st == HDL_OK ? 0 : 1;
+}
+
+int CmdScan(CmdCtx& ctx) {
+    using namespace hdl::proto;
+    std::vector<uint8_t> req;
+    std::vector<uint8_t> resp;
+
+    const char* pattern = nullptr;
+    std::string pattern_storage;
+    std::wstring value_text;
+    bool have_value = false;
+    bool do_next = false;
+    bool do_hits = false;
+    bool do_close = false;
+    bool do_reset = false;
+    bool unaligned = false;
+    bool stream = false;
+    int32_t value_type = -1;
+    int32_t cmp = HDL_CMP_EXACT;
+    bool have_cmp = false;
+    uint64_t start = 0;
+    uint64_t size = 0;
+    uint64_t session = 0;
+    bool have_session = false;
+    uint64_t job_id = 0;
+    uint32_t timeout_ms = 0;
+    uint32_t max_hits = 64;
+
+    for (int i = 3; i < ctx.argc; ++i) {
+        if (wcscmp(ctx.argv[i], L"--pattern") == 0 && i + 1 < ctx.argc) {
+            ++i;
+            char buf[512];
+            WideCharToMultiByte(CP_UTF8, 0, ctx.argv[i], -1, buf, sizeof(buf), nullptr, nullptr);
+            pattern_storage = buf;
+            pattern = pattern_storage.c_str();
+            value_type = HDL_VALUE_BYTES;
+        } else if (wcscmp(ctx.argv[i], L"--type") == 0 && i + 1 < ctx.argc) {
+            if (!ParseValueType(ctx.argv[++i], &value_type)) {
+                wprintf(L"Unknown --type\n");
+                return 1;
+            }
+        } else if (wcscmp(ctx.argv[i], L"--value") == 0 && i + 1 < ctx.argc) {
+            value_text = ctx.argv[++i];
+            have_value = true;
+        } else if (wcscmp(ctx.argv[i], L"--cmp") == 0 && i + 1 < ctx.argc) {
+            if (!ParseCmp(ctx.argv[++i], &cmp)) {
+                wprintf(L"Unknown --cmp\n");
+                return 1;
+            }
+            have_cmp = true;
+        } else if (wcscmp(ctx.argv[i], L"--start") == 0 && i + 1 < ctx.argc) {
+            ParseHexU64(ctx.argv[++i], &start);
+        } else if (wcscmp(ctx.argv[i], L"--size") == 0 && i + 1 < ctx.argc) {
+            ParseHexU64(ctx.argv[++i], &size);
+        } else if (wcscmp(ctx.argv[i], L"--max") == 0 && i + 1 < ctx.argc) {
+            max_hits = static_cast<uint32_t>(_wtoi(ctx.argv[++i]));
+        } else if (wcscmp(ctx.argv[i], L"--session") == 0 && i + 1 < ctx.argc) {
+            session = _wcstoui64(ctx.argv[++i], nullptr, 0);
+            have_session = true;
+        } else if (wcscmp(ctx.argv[i], L"--job") == 0 && i + 1 < ctx.argc) {
+            job_id = _wcstoui64(ctx.argv[++i], nullptr, 0);
+        } else if (wcscmp(ctx.argv[i], L"--timeout") == 0 && i + 1 < ctx.argc) {
+            timeout_ms = static_cast<uint32_t>(_wtoi(ctx.argv[++i]));
+        } else if (wcscmp(ctx.argv[i], L"--next") == 0) {
+            do_next = true;
+        } else if (wcscmp(ctx.argv[i], L"--hits") == 0) {
+            do_hits = true;
+        } else if (wcscmp(ctx.argv[i], L"--close") == 0) {
+            do_close = true;
+        } else if (wcscmp(ctx.argv[i], L"--reset") == 0) {
+            do_reset = true;
+        } else if (wcscmp(ctx.argv[i], L"--unaligned") == 0) {
+            unaligned = true;
+        } else if (wcscmp(ctx.argv[i], L"--stream") == 0) {
+            stream = true;
+        }
+    }
+
+    auto append_job_trailer = [&](std::vector<uint8_t>& out, uint32_t flags = 0) {
+        AppendPod(out, job_id);
+        AppendPod(out, timeout_ms);
+        AppendPod(out, flags);
+    };
+
+    // Legacy one-shot AOB path (no session).
+    if (pattern && !do_next && !do_hits && !do_close && !do_reset && value_type == HDL_VALUE_BYTES &&
+        !have_session && !have_cmp) {
+        AppendPod(req, static_cast<uint32_t>(OpSearchMemory));
+        AppendPod(req, start);
+        AppendPod(req, size);
+        AppendPod(req, max_hits);
+        AppendString(req, pattern);
+        append_job_trailer(req, stream ? HDL_IPC_REQ_STREAM : 0);
+        if (stream) {
+            if (!ctx.client.RequestStream(req, [&](int32_t st, uint32_t, const uint8_t* p, size_t n) {
+                    Reader r(p, n);
+                    uint32_t total = 0, off = 0, count = 0;
+                    if (!r.TakePod(total) || !r.TakePod(off) || !r.TakePod(count)) return false;
+                    if (off == 0) wprintf(L"status=%ls hits=%u\n", StatusName(st), total);
+                    for (uint32_t i = 0; i < count; ++i) {
+                        uint64_t hit = 0;
+                        if (!r.TakePod(hit)) return false;
+                        wprintf(L"  %016llx\n", static_cast<unsigned long long>(hit));
+                    }
+                    return true;
+                })) {
+                return 1;
+            }
+            return 0;
+        }
+        if (!ctx.client.Request(req, resp)) return 1;
+        Reader r(resp);
+        int32_t st = 0;
+        uint32_t count = 0;
+        if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+        wprintf(L"status=%ls hits=%u\n", StatusName(st), count);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint64_t hit = 0;
+            if (!r.TakePod(hit)) break;
+            wprintf(L"  %016llx\n", static_cast<unsigned long long>(hit));
+        }
+        return st == HDL_OK ? 0 : 1;
+    }
+
+    if (do_hits || do_close || do_reset || do_next) {
+        if (!have_session) {
+            wprintf(L"--session required\n");
+            return 1;
+        }
+    }
+
+    if (do_hits) {
+        return PrintScanHits(ctx.client, session, max_hits, stream);
+    }
+    if (do_close || do_reset) {
+        AppendPod(req, static_cast<uint32_t>(do_close ? OpSearchClose : OpSearchReset));
+        AppendPod(req, session);
+        if (!ctx.client.Request(req, resp)) return 1;
+        Reader r(resp);
+        int32_t st = 0;
+        r.TakePod(st);
+        wprintf(L"status=%ls session=%llu\n", StatusName(st),
+                static_cast<unsigned long long>(session));
+        return st == HDL_OK ? 0 : 1;
+    }
+
+    if (do_next) {
+        std::vector<uint8_t> encoded;
+        if (have_value) {
+            // Type is unknown on the ctx.client for next; encode as raw for bytes pattern
+            // or require --type when value is supplied.
+            if (value_type < 0) {
+                wprintf(L"--type required with --value on --next\n");
+                return 1;
+            }
+            if (!EncodeTypedValue(value_type, value_text.c_str(), encoded)) {
+                wprintf(L"Bad --value\n");
+                return 1;
+            }
+        }
+        AppendPod(req, static_cast<uint32_t>(OpSearchNext));
+        AppendPod(req, session);
+        AppendPod(req, cmp);
+        AppendPod(req, static_cast<uint32_t>(encoded.size()));
+        if (!encoded.empty()) {
+            AppendBytes(req, encoded.data(), encoded.size());
+        }
+        append_job_trailer(req);
+        if (!ctx.client.Request(req, resp)) return 1;
+        Reader r(resp);
+        int32_t st = 0;
+        uint32_t count = 0;
+        if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+        wprintf(L"status=%ls hits=%u session=%llu\n", StatusName(st), count,
+                static_cast<unsigned long long>(session));
+        if (st == HDL_OK) {
+            return PrintScanHits(ctx.client, session, max_hits, stream);
+        }
+        return 1;
+    }
+
+    // First typed / session scan.
+    if (value_type < 0) {
+        wprintf(L"--type or --pattern required\n");
+        return 1;
+    }
+    if (cmp != HDL_CMP_UNKNOWN && !have_value && value_type != HDL_VALUE_BYTES) {
+        wprintf(L"--value required\n");
+        return 1;
+    }
+    if (value_type == HDL_VALUE_BYTES && !have_value && !pattern) {
+        wprintf(L"--value/--pattern required for bytes\n");
+        return 1;
+    }
+
+    std::vector<uint8_t> encoded;
+    if (value_type == HDL_VALUE_BYTES) {
+        const wchar_t* src = have_value ? value_text.c_str() : nullptr;
+        std::wstring tmp;
+        if (pattern && !have_value) {
+            // pattern already narrow; re-widen for EncodeTypedValue path via storage
+            wchar_t wbuf[1024];
+            MultiByteToWideChar(CP_UTF8, 0, pattern, -1, wbuf, 1024);
+            tmp = wbuf;
+            src = tmp.c_str();
+            if (!EncodeTypedValue(HDL_VALUE_BYTES, src, encoded)) {
+                wprintf(L"Bad pattern\n");
+                return 1;
+            }
+        } else if (!EncodeTypedValue(HDL_VALUE_BYTES, value_text.c_str(), encoded)) {
+            wprintf(L"Bad --value\n");
+            return 1;
+        }
+    } else if (cmp != HDL_CMP_UNKNOWN) {
+        if (!EncodeTypedValue(value_type, value_text.c_str(), encoded)) {
+            wprintf(L"Bad --value\n");
+            return 1;
+        }
+    }
+
+    if (!have_session) {
+        if (!IpcCreateSession(ctx.client, &session)) {
+            return 1;
+        }
+        have_session = true;
+    }
+
+    AppendPod(req, static_cast<uint32_t>(OpSearchFirst));
+    AppendPod(req, session);
+    AppendPod(req, start);
+    AppendPod(req, size);
+    AppendPod(req, value_type);
+    AppendPod(req, cmp);
+    AppendPod(req, unaligned ? 1u : 0u);
+    AppendPod(req, max_hits);
+    AppendPod(req, static_cast<uint32_t>(encoded.size()));
+    if (!encoded.empty()) {
+        AppendBytes(req, encoded.data(), encoded.size());
+    }
+    uint32_t search_flags = 0;
+    std::wstring module;
+    for (int i = 3; i < ctx.argc; ++i) {
+        if (wcscmp(ctx.argv[i], L"--image") == 0) {
+            search_flags |= HDL_SEARCH_IMAGE;
+        } else if (wcscmp(ctx.argv[i], L"--executable") == 0) {
+            search_flags |= HDL_SEARCH_EXECUTABLE;
+        } else if (wcscmp(ctx.argv[i], L"--module") == 0 && i + 1 < ctx.argc) {
+            module = ctx.argv[++i];
+            search_flags |= HDL_SEARCH_MODULE;
+        }
+    }
+    AppendPod(req, search_flags);
+    AppendWString(req, module.c_str());
+    append_job_trailer(req);
+    if (!ctx.client.Request(req, resp)) return 1;
+    Reader r(resp);
+    int32_t st = 0;
+    uint32_t count = 0;
+    if (!r.TakePod(st) || !r.TakePod(count)) return 1;
+    wprintf(L"status=%ls hits=%u session=%llu\n", StatusName(st), count,
+            static_cast<unsigned long long>(session));
+    if (st == HDL_OK) {
+        return PrintScanHits(ctx.client, session, max_hits, stream);
+    }
+    return 1;
+}
+
